@@ -919,9 +919,15 @@ class NodeFlowIndex(GraphIndex):
 
     @property
     def layers(self):
-        """Return layers.
+        """Return layer offsets.
         """
         return self._layers
+
+    @property
+    def flows(self):
+        """Return flow offsets.
+        """
+        return self._flows
 
     def __getstate__(self):
         raise NotImplementedError(
