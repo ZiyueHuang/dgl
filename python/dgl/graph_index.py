@@ -1087,6 +1087,7 @@ _EMPTY_ARRAYS = [utils.toindex(F.ones(shape=(0), dtype=F.int64, ctx=F.cpu()))]
 
 def _uniform_sampling(gidx, seed_ids, neigh_type, num_hops, expand_factor):
     num_seeds = len(seed_ids)
+    num_neigh_arr = utils.toindex([expand_factor for i in range(num_hops)]).todgltensor()
     empty_ids = []
     if len(seed_ids) > 1 and len(seed_ids) not in _NEIGHBOR_SAMPLING_APIS.keys():
         remain = 2**int(math.ceil(math.log2(len(dgl_ids)))) - len(dgl_ids)
@@ -1094,4 +1095,4 @@ def _uniform_sampling(gidx, seed_ids, neigh_type, num_hops, expand_factor):
         seed_ids.extend([empty.todgltensor() for empty in empty_ids])
     assert len(seed_ids) in _NEIGHBOR_SAMPLING_APIS.keys()
     return _NEIGHBOR_SAMPLING_APIS[len(seed_ids)](gidx._handle, *seed_ids, neigh_type,
-                                                  num_hops, expand_factor, num_seeds)
+                                                  num_hops, num_neigh_arr, num_seeds)

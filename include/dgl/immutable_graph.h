@@ -467,7 +467,7 @@ class ImmutableGraph: public GraphInterface {
    * \return a subgraph
    */
   NodeFlow NeighborUniformSample(IdArray seeds, const std::string &neigh_type,
-                                 int num_hops, int expand_factor) const;
+                                 int num_hops, const std::vector<size_t>& num_neigh_vec) const;
 
   /*!
    * \brief Get the adjacency matrix of the graph.
@@ -524,7 +524,7 @@ class ImmutableGraph: public GraphInterface {
 
   NodeFlow SampleSubgraph(IdArray seed_arr, const float* probability,
                           const std::string &neigh_type,
-                          int num_hops, size_t num_neighbor) const;
+                          int num_hops, const std::vector<size_t>& num_neigh_vec) const;
 
   /*!
    * \brief Compact a subgraph.

@@ -444,7 +444,13 @@ void CAPI_NeighborUniformSample(DGLArgs args, DGLRetValue* rv) {
     seeds[i] = IdArray::FromDLPack(CreateTmpDLManagedTensor(args[i + 1]));
   std::string neigh_type = args[num_seeds + 1];
   const int num_hops = args[num_seeds + 2];
-  const int num_neighbors = args[num_seeds + 3];
+
+  IdArray num_neighbors_arr = IdArray::FromDLPack(CreateTmpDLManagedTensor(args[num_seeds + 3]));
+  const dgl_id_t* num_neighbors_ptr = static_cast<dgl_id_t*>(num_neighbors_arr->data);
+  std::vector<size_t> num_neighbors_vec(num_hops);
+  for (size_t i = 0; i < num_neighbors_vec.size(); i++)
+    num_neighbors_vec[i] = static_cast<size_t>(num_neighbors_ptr[i]);
+
   const int num_valid_seeds = args[num_seeds + 4];
   const GraphInterface *ptr = static_cast<const GraphInterface *>(ghandle);
   const ImmutableGraph *gptr = dynamic_cast<const ImmutableGraph*>(ptr);
@@ -453,7 +459,7 @@ void CAPI_NeighborUniformSample(DGLArgs args, DGLRetValue* rv) {
   std::vector<NodeFlow> subgs(seeds.size());
 #pragma omp parallel for
   for (int i = 0; i < num_valid_seeds; i++) {
-    subgs[i] = gptr->NeighborUniformSample(seeds[i], neigh_type, num_hops, num_neighbors);
+    subgs[i] = gptr->NeighborUniformSample(seeds[i], neigh_type, num_hops, num_neighbors_vec);
   }
   *rv = ConvertSubgraphToPackedFunc(subgs);
 }

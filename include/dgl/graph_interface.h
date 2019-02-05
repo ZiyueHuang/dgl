@@ -339,7 +339,7 @@ class GraphInterface {
    * \return a NodeFlow graph.
    */
   virtual NodeFlow NeighborUniformSample(IdArray seeds, const std::string &neigh_type,
-                                         int num_hops, int expand_factor) const = 0;
+                                         int num_hops, const std::vector<size_t>& num_neigh_vec) const = 0;
 };
 
 /*! \brief Subgraph data structure */
