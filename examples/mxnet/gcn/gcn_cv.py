@@ -1,0 +1,305 @@
+import argparse, time, math
+import numpy as np
+import mxnet as mx
+from mxnet import gluon
+import dgl
+import dgl.function as fn
+from dgl import DGLGraph
+from dgl.data import register_data_args, load_data
+
+
+class GCNLayer(gluon.Block):
+    def __init__(self,
+                 layer_id,
+                 in_feats,
+                 out_feats,
+                 activation,
+                 dropout,
+                 **kwargs):
+        super(GCNLayer, self).__init__(**kwargs)
+        self.layer_id = layer_id
+        with self.name_scope():
+            self.dense = gluon.nn.Dense(out_feats, activation, in_units=in_feats)
+        self.dropout = dropout
+
+    def forward(self, nf, h):
+        new_history = h
+        history_str = 'h_{}'.format(self.layer_id)
+        history = nf.layers[self.layer_id].data[history_str]
+        h = h - history
+
+        nf.layers[self.layer_id].data['h'] = h
+        nf.flow_compute(fn.copy_src(src='h', out='m'),
+                        fn.sum(msg='m', out='h'),
+                        range=self.layer_id)
+        h = nf.layers[self.layer_id+1].data.pop('h')
+        
+        norm = nf.layers[self.layer_id+1].data['norm']
+        subg_norm = nf.layers[self.layer_id+1].data['subg_norm']
+
+        agg_history_str = 'agg_h_{}'.format(self.layer_id)
+        agg_history = nf.layers[self.layer_id+1].data[agg_history_str]
+        # control variate
+        h = h * subg_norm + agg_history * norm
+        if self.dropout:
+            h = mx.nd.Dropout(h, p=self.dropout)
+        h = self.dense(h)
+        # update history
+        if self.layer_id < nf.num_layers-1:
+            nf.layers[self.layer_id].data[history_str] = h
+
+        return h
+
+
+class GCNSampling(gluon.Block):
+    def __init__(self,
+                 in_feats,
+                 n_hidden,
+                 n_classes,
+                 n_layers,
+                 activation,
+                 dropout,
+                 **kwargs):
+        super(GCNSampling, self).__init__(**kwargs)
+        self.dropout = dropout
+        with self.name_scope():
+            self.layers = gluon.nn.Sequential()
+            # input layer
+            self.dense = gluon.nn.Dense(n_hidden, activation, in_units=in_feats)
+            # hidden layers
+            for i in range(n_layers-1):
+                self.layers.add(GCNLayer(i, n_hidden, n_hidden, activation, dropout))
+            # output layer
+            self.layers.add(GCNLayer(n_layers-1, n_hidden, n_classes, None, dropout))
+
+    def forward(self, nf):
+        h = nf.layers[0].data['preprocess']
+        if self.dropout:
+            h = mx.nd.Dropout(h, p=self.dropout)
+        h = self.dense(h)
+
+        for layer in self.layers:
+            h = layer(nf, h)
+
+        return h
+
+
+class GCNInferLayer(gluon.Block):
+    def __init__(self,
+                 layer_id,
+                 in_feats,
+                 out_feats,
+                 activation,
+                 **kwargs):
+        super(GCNInferLayer, self).__init__(**kwargs)
+        self.layer_id = layer_id
+        with self.name_scope():
+            self.dense = gluon.nn.Dense(out_feats, activation, in_units=in_feats)
+
+    def forward(self, nf, h):
+        nf.layers[self.layer_id].data['h'] = h
+
+        nf.flow_compute(fn.copy_src(src='h', out='m'),
+                        fn.sum(msg='m', out='h'),
+                        range=self.layer_id)
+
+        h = nf.layers[self.layer_id+1].data.pop('h')
+        norm = nf.layers[self.layer_id+1].data['norm']
+        h = h * norm
+        h = self.dense(h)
+        return h
+
+
+
+class GCNInfer(gluon.Block):
+    def __init__(self,
+                 in_feats,
+                 n_hidden,
+                 n_classes,
+                 n_layers,
+                 activation,
+                 **kwargs):
+        super(GCNInfer, self).__init__(**kwargs)
+        with self.name_scope():
+            self.layers = gluon.nn.Sequential()
+            # input layer
+            self.dense = gluon.nn.Dense(n_hidden, activation, in_units=in_feats)
+            # hidden layers
+            for i in range(n_layers-1):
+                self.layers.add(GCNInferLayer(i, n_hidden, n_hidden, activation))
+            # output layer
+            self.layers.add(GCNInferLayer(n_layers-1, n_hidden, n_classes, None))
+
+
+    def forward(self, nf, h):
+        h = nf.layers[0].data['preprocess']
+        h = self.dense(h)
+
+        for layer in self.layers:
+            h = layer(nf, h)
+
+        return h
+
+
+def main(args):
+    # load and preprocess dataset
+    data = load_data(args)
+
+    if args.self_loop and args.dataset != 'reddit':
+        data.graph.add_edges_from([(i,i) for i in range(len(data.graph))])
+
+    train_nid = mx.nd.array(np.nonzero(data.train_mask)[0]).astype(np.int64)
+    test_nid = mx.nd.array(np.nonzero(data.test_mask)[0]).astype(np.int64)
+
+    num_neighbors = args.num_neighbors
+    n_layers = args.n_layers
+
+    features = mx.nd.array(data.features)
+    labels = mx.nd.array(data.labels)
+    train_mask = mx.nd.array(data.train_mask)
+    val_mask = mx.nd.array(data.val_mask)
+    test_mask = mx.nd.array(data.test_mask)
+    in_feats = features.shape[1]
+    n_classes = data.num_labels
+    n_edges = data.graph.number_of_edges()
+
+    n_train_samples = train_mask.sum().asscalar()
+    n_test_samples = test_mask.sum().asscalar()
+    n_val_samples = val_mask.sum().asscalar()
+
+    print("""----Data statistics------'
+      #Edges %d
+      #Classes %d
+      #Train samples %d
+      #Val samples %d
+      #Test samples %d""" %
+          (n_edges, n_classes,
+              n_train_samples,
+              n_val_samples,
+              n_test_samples))
+
+    # create GCN model
+    g = DGLGraph(data.graph, readonly=True)
+
+    g.ndata['features'] = features
+
+    degs = g.in_degrees().astype('float32')
+    degs[degs == 0] = 1
+    degs[degs > num_neighbors] = num_neighbors
+    g.ndata['subg_norm'] = mx.nd.expand_dims(1./degs, 1)
+
+    norm = mx.nd.expand_dims(1./g.in_degrees().astype('float32'), 1)
+    g.ndata['norm'] = norm
+
+    g.update_all(fn.copy_src(src='features', out='m'),
+                 fn.sum(msg='m', out='preprocess'))
+    g.ndata['preprocess'] = g.ndata['preprocess'] * norm
+
+    for i in range(n_layers):
+        g.ndata['h_{}'.format(i)] = mx.nd.zeros((features.shape[0], n_hidden))
+
+    model = GCNSampling(in_feats,
+                        args.n_hidden,
+                        n_classes,
+                        n_layers,
+                        'relu',
+                        args.dropout,
+                        prefix='GCN')
+
+    model.initialize()
+
+    loss_fcn = gluon.loss.SoftmaxCELoss()
+
+    infer_model = GCNInfer(in_feats,
+                           args.n_hidden,
+                           n_classes,
+                           n_layers,
+                           'relu',
+                           prefix='GCN')
+
+    infer_model.initialize()
+
+    # use optimizer
+    print(model.collect_params())
+    trainer = gluon.Trainer(model.collect_params(), 'adam',
+                            {'learning_rate': args.lr, 'wd': args.weight_decay},
+                            kvstore=mx.kv.create('local'))
+
+    # initialize graph
+    dur = []
+    for epoch in range(args.n_epochs):
+        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.batch_size, num_neighbors,
+                                                            neighbor_type='in', shuffle=True,
+                                                            num_hops=n_layers+1,
+                                                            seed_nodes=train_nid):
+            for i in range(n_layers):
+                g.pull(nf.layer_parent_nid(i+1), fn.copy_src(src='h_{}'.format(i), out='m'),
+                       fn.sum(msg='m', out='agg_h_{}'.format(i)))
+
+            nf.copy_from_parent()
+            # forward
+            with mx.autograd.record():
+                pred = model(nf)
+                batch_nids = nf.layer_parent_nid(-1)
+                batch_labels = labels[batch_nids]
+                loss = loss_fcn(pred, batch_labels)
+                loss = loss.sum() / len(batch_nids)
+
+            loss.backward()
+            trainer.step(batch_size=1)
+
+            #TODO
+            #nf.copy_to_parent()
+
+        infer_params = infer_model.collect_params()
+
+        for key in infer_params:
+            idx = trainer._param2idx[key]
+            trainer._kvstore.pull(idx, out=infer_params[key].data())
+
+        num_acc = 0.
+
+        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.test_batch_size, g.number_of_nodes(),
+                                                            neighbor_type='in', num_hops=n_layers+1,
+                                                            seed_nodes=test_nid):
+            nf.copy_from_parent()
+            pred = infer_model(nf)
+            batch_nids = nf.layer_parent_nid(-1)
+            batch_labels = labels[batch_nids]
+            num_acc += (pred.argmax(axis=1) == batch_labels).sum().asscalar()
+
+        print("Test Accuracy {:.4f}". format(num_acc/n_test_samples))
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='GCN')
+    register_data_args(parser)
+    parser.add_argument("--dropout", type=float, default=0.5,
+            help="dropout probability")
+    parser.add_argument("--gpu", type=int, default=-1,
+            help="gpu")
+    parser.add_argument("--lr", type=float, default=3e-2,
+            help="learning rate")
+    parser.add_argument("--n-epochs", type=int, default=200,
+            help="number of training epochs")
+    parser.add_argument("--batch-size", type=int, default=1000,
+            help="train batch size")
+    parser.add_argument("--test-batch-size", type=int, default=1000,
+            help="test batch size")
+    parser.add_argument("--num-neighbors", type=int, default=3,
+            help="number of neighbors to be sampled")
+    parser.add_argument("--n-hidden", type=int, default=16,
+            help="number of hidden gcn units")
+    parser.add_argument("--n-layers", type=int, default=1,
+            help="number of hidden gcn layers")
+    parser.add_argument("--self-loop", action='store_true',
+            help="graph self-loop (default=False)")
+    parser.add_argument("--weight-decay", type=float, default=5e-4,
+            help="Weight for L2 loss")
+    args = parser.parse_args()
+
+    print(args)
+
+    main(args)
+
+
