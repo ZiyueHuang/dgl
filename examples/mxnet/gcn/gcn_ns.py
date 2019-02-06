@@ -8,20 +8,36 @@ from dgl import DGLGraph
 from dgl.data import register_data_args, load_data
 
 
-def gcn_reduce(node):
-    accum = mx.nd.mean(node.mailbox['m'], 1)
-    return {'h': accum}
+class GCNLayer(gluon.Block):
+    def __init__(self,
+                 layer_id,
+                 in_feats,
+                 out_feats,
+                 activation,
+                 dropout,
+                 test=False,
+                 **kwargs):
+        super(GCNLayer, self).__init__(**kwargs)
+        self.layer_id = layer_id
+        with self.name_scope():
+            self.dense = gluon.nn.Dense(out_feats, activation, in_units=in_feats)
+        self.dropout = dropout
+        if test:
+            self.norm = 'norm'
+        else:
+            self.norm = 'subg_norm'
 
-
-class NodeUpdate(gluon.Block):
-    def __init__(self, in_feats, out_feats, activation=None):
-        super(NodeUpdate, self).__init__()
-        self.dense = gluon.nn.Dense(out_feats, activation, in_units=in_feats)
-
-    def forward(self, node):
-        h = node.data['h']
+    def forward(self, nf, h):
+        nf.layers[self.layer_id].data['h'] = h
+        nf.flow_compute(fn.copy_src(src='h', out='m'),
+                        fn.sum(msg='m', out='h'),
+                        range=self.layer_id)
+        h = nf.layers[self.layer_id+1].data.pop('h')
+        h = h * nf.layers[self.layer_id+1].data[self.norm]
+        if self.dropout:
+            h = mx.nd.Dropout(h, p=self.dropout)
         h = self.dense(h)
-        return {'activation': h}
+        return h
 
 
 class GCNSampling(gluon.Block):
@@ -34,29 +50,23 @@ class GCNSampling(gluon.Block):
                  dropout,
                  **kwargs):
         super(GCNSampling, self).__init__(**kwargs)
-        self.dropout = dropout
         with self.name_scope():
             self.layers = gluon.nn.Sequential()
             # input layer
-            self.layers.add(NodeUpdate(in_feats, n_hidden, activation))
+            self.layers.add(GCNLayer(0, in_feats, n_hidden, activation, dropout))
             # hidden layers
-            for i in range(n_layers - 1):
-                self.layers.add(NodeUpdate(n_hidden, n_hidden, activation))
+            for i in range(1, n_layers):
+                self.layers.add(GCNLayer(i, n_hidden, n_hidden, activation, dropout))
             # output layer
-            self.layers.add(NodeUpdate(n_hidden, n_classes, None))
+            self.layers.add(GCNLayer(n_layers, n_hidden, n_classes, None, dropout))
 
 
     def forward(self, nf):
-        nf.layers[0].data['activation'] = nf.layers[0].data['features']
+        h = nf.layers[0].data['features']
 
-        for i, layer in enumerate(self.layers):
-            h = nf.layers[i].data.pop('activation')
-            if self.dropout:
-                h = mx.nd.Dropout(h, p=self.dropout)
-            nf.layers[i].data['h'] = h
-            nf.flow_compute(fn.copy_src(src='h', out='m'), gcn_reduce, layer, range=i)
+        for layer in self.layers:
+            h = layer(nf, h)
 
-        h = nf.layers[-1].data.pop('activation')
         return h
 
 
@@ -67,32 +77,25 @@ class GCNInfer(gluon.Block):
                  n_classes,
                  n_layers,
                  activation,
-                 dropout,
                  **kwargs):
         super(GCNInfer, self).__init__(**kwargs)
-        self.dropout = dropout
         with self.name_scope():
             self.layers = gluon.nn.Sequential()
             # input layer
-            self.layers.add(NodeUpdate(in_feats, n_hidden, activation))
+            self.layers.add(GCNLayer(0, in_feats, n_hidden, activation, 0, test=True))
             # hidden layers
-            for i in range(n_layers - 1):
-                self.layers.add(NodeUpdate(n_hidden, n_hidden, activation))
+            for i in range(1, n_layers):
+                self.layers.add(GCNLayer(i, n_hidden, n_hidden, activation, 0, test=True))
             # output layer
-            self.layers.add(NodeUpdate(n_hidden, n_classes, None))
+            self.layers.add(GCNLayer(n_layers, n_hidden, n_classes, None, 0, test=True))
 
 
     def forward(self, nf):
-        nf.layers[0].data['activation'] = nf.layers[0].data['features']
+        h = nf.layers[0].data['features']
 
-        for i, layer in enumerate(self.layers):
-            h = nf.layers[i].data.pop('activation')
-            if self.dropout:
-                h = mx.nd.Dropout(h, p=self.dropout)
-            nf.layers[i].data['h'] = h
-            nf.flow_compute(fn.copy_src(src='h', out='m'), gcn_reduce, layer, range=i)
+        for layer in self.layers:
+            h = layer(nf, h)
 
-        h = nf.layers[-1].data.pop('activation')
         return h
 
 
@@ -106,6 +109,8 @@ def main(args):
     train_nid = mx.nd.array(np.nonzero(data.train_mask)[0]).astype(np.int64)
     test_nid = mx.nd.array(np.nonzero(data.test_mask)[0]).astype(np.int64)
 
+    num_neighbors = args.num_neighbors
+
     features = mx.nd.array(data.features)
     labels = mx.nd.array(data.labels)
     train_mask = mx.nd.array(data.train_mask)
@@ -114,6 +119,11 @@ def main(args):
     in_feats = features.shape[1]
     n_classes = data.num_labels
     n_edges = data.graph.number_of_edges()
+
+    n_train_samples = train_mask.sum().asscalar()
+    n_test_samples = test_mask.sum().asscalar()
+    n_val_samples = val_mask.sum().asscalar()
+
     print("""----Data statistics------'
       #Edges %d
       #Classes %d
@@ -121,14 +131,22 @@ def main(args):
       #Val samples %d
       #Test samples %d""" %
           (n_edges, n_classes,
-              train_mask.sum().asscalar(),
-              val_mask.sum().asscalar(),
-              test_mask.sum().asscalar()))
+              n_train_samples,
+              n_val_samples,
+              n_test_samples))
 
     # create GCN model
     g = DGLGraph(data.graph, readonly=True)
 
     g.ndata['features'] = features
+
+    degs = g.in_degrees().astype('float32')
+    degs[degs == 0] = 1
+    degs[degs > num_neighbors] = num_neighbors
+    g.ndata['subg_norm'] = mx.nd.expand_dims(1./degs, 1)
+
+    norm = mx.nd.expand_dims(1./g.in_degrees().astype('float32'), 1)
+    g.ndata['norm'] = norm
 
     model = GCNSampling(in_feats,
                         args.n_hidden,
@@ -139,7 +157,7 @@ def main(args):
                         prefix='GCN')
 
     model.initialize()
-    n_train_samples = train_mask.sum().asscalar()
+
     loss_fcn = gluon.loss.SoftmaxCELoss()
 
     infer_model = GCNInfer(in_feats,
@@ -147,7 +165,6 @@ def main(args):
                            n_classes,
                            args.n_layers,
                            'relu',
-                           args.dropout,
                            prefix='GCN')
 
     infer_model.initialize()
@@ -155,22 +172,23 @@ def main(args):
     # use optimizer
     print(model.collect_params())
     trainer = gluon.Trainer(model.collect_params(), 'adam',
-            {'learning_rate': args.lr, 'wd': args.weight_decay}, kvstore=mx.kv.create('local'))
+                            {'learning_rate': args.lr, 'wd': args.weight_decay},
+                            kvstore=mx.kv.create('local'))
 
     # initialize graph
     dur = []
     for epoch in range(args.n_epochs):
-        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.batch_size, args.num_neighbors,
+        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.batch_size, num_neighbors,
                                                             neighbor_type='in', shuffle=True,
                                                             num_hops=args.n_layers+1,
                                                             seed_nodes=train_nid):
-            print('train')
             nf.copy_from_parent()
             # forward
             with mx.autograd.record():
                 pred = model(nf)
                 batch_nids = nf.layer_parent_nid(-1)
-                loss = loss_fcn(pred, labels[batch_nids])
+                batch_labels = labels[batch_nids]
+                loss = loss_fcn(pred, batch_labels)
                 loss = loss.sum() / len(batch_nids)
 
             loss.backward()
@@ -184,16 +202,16 @@ def main(args):
 
         num_acc = 0.
 
-        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.batch_size, g.number_of_nodes(),
+        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.test_batch_size, g.number_of_nodes(),
                                                             neighbor_type='in', num_hops=args.n_layers+1,
                                                             seed_nodes=test_nid):
-            print('test')
             nf.copy_from_parent()
             pred = infer_model(nf)
             batch_nids = nf.layer_parent_nid(-1)
-            num_acc += (pred.argmax(axis=1) == labels[batch_nids]).sum().asscalar()
+            batch_labels = labels[batch_nids]
+            num_acc += (pred.argmax(axis=1) == batch_labels).sum().asscalar()
 
-        print("Test Accuracy {:.4f}". format(num_acc/len(test_nid)))
+        print("Test Accuracy {:.4f}". format(num_acc/n_test_samples))
 
 
 if __name__ == '__main__':
@@ -207,8 +225,10 @@ if __name__ == '__main__':
             help="learning rate")
     parser.add_argument("--n-epochs", type=int, default=200,
             help="number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=20,
-            help="batch size")
+    parser.add_argument("--batch-size", type=int, default=1000,
+            help="train batch size")
+    parser.add_argument("--test-batch-size", type=int, default=1000,
+            help="test batch size")
     parser.add_argument("--num-neighbors", type=int, default=3,
             help="number of neighbors to be sampled")
     parser.add_argument("--n-hidden", type=int, default=16,
