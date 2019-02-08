@@ -30,10 +30,11 @@ class GCNLayer(gluon.Block):
     def forward(self, nf, h):
         nf.layers[self.layer_id].data['h'] = h
         nf.flow_compute(fn.copy_src(src='h', out='m'),
-                        fn.sum(msg='m', out='h'),
+                        #fn.sum(msg='m', out='h'),
+                        lambda node : {'h': node.mailbox['m'].mean(axis=1)},
                         range=self.layer_id)
         h = nf.layers[self.layer_id+1].data.pop('h')
-        h = h * nf.layers[self.layer_id+1].data[self.norm]
+        #h = h * nf.layers[self.layer_id+1].data[self.norm]
         if self.dropout:
             h = mx.nd.Dropout(h, p=self.dropout)
         h = self.dense(h)
