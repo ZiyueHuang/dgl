@@ -2,43 +2,25 @@ import argparse, time, math
 import numpy as np
 import mxnet as mx
 from mxnet import gluon
+from functools import partial
 import dgl
 import dgl.function as fn
 from dgl import DGLGraph
 from dgl.data import register_data_args, load_data
 
 
-class GCNLayer(gluon.Block):
-    def __init__(self,
-                 layer_id,
-                 in_feats,
-                 out_feats,
-                 activation,
-                 dropout,
-                 test=False,
-                 **kwargs):
-        super(GCNLayer, self).__init__(**kwargs)
-        self.layer_id = layer_id
-        with self.name_scope():
-            self.dense = gluon.nn.Dense(out_feats, activation, in_units=in_feats)
-        self.dropout = dropout
-        if test:
-            self.norm = 'norm'
-        else:
-            self.norm = 'subg_norm'
+class NodeUpdate(gluon.Block):
+    def __init__(self, in_feats, out_feats, activation=None, test=False):
+        super(NodeUpdate, self).__init__()
+        self.dense = gluon.nn.Dense(out_feats, activation, in_units=in_feats)
+        self.test = test
 
-    def forward(self, nf, h):
-        nf.layers[self.layer_id].data['h'] = h
-        nf.flow_compute(fn.copy_src(src='h', out='m'),
-                        #fn.sum(msg='m', out='h'),
-                        lambda node : {'h': node.mailbox['m'].mean(axis=1)},
-                        range=self.layer_id)
-        h = nf.layers[self.layer_id+1].data.pop('h')
-        #h = h * nf.layers[self.layer_id+1].data[self.norm]
-        if self.dropout:
-            h = mx.nd.Dropout(h, p=self.dropout)
+    def forward(self, node):
+        h = node.data['h']
+        if self.test:
+            h = h * node.data['norm']
         h = self.dense(h)
-        return h
+        return {'activation': h}
 
 
 class GCNSampling(gluon.Block):
@@ -51,23 +33,33 @@ class GCNSampling(gluon.Block):
                  dropout,
                  **kwargs):
         super(GCNSampling, self).__init__(**kwargs)
+        self.dropout = dropout
+        self.n_layers = n_layers
         with self.name_scope():
             self.layers = gluon.nn.Sequential()
             # input layer
-            self.layers.add(GCNLayer(0, in_feats, n_hidden, activation, dropout))
+            self.layers.add(NodeUpdate(in_feats, n_hidden, activation))
             # hidden layers
             for i in range(1, n_layers):
-                self.layers.add(GCNLayer(i, n_hidden, n_hidden, activation, dropout))
+                self.layers.add(NodeUpdate(n_hidden, n_hidden, activation))
             # output layer
-            self.layers.add(GCNLayer(n_layers, n_hidden, n_classes, None, dropout))
+            self.layers.add(NodeUpdate(n_hidden, n_classes))
 
 
     def forward(self, nf):
-        h = nf.layers[0].data['features']
+        nf.layers[0].data['activation'] = nf.layers[0].data['features']
 
-        for layer in self.layers:
-            h = layer(nf, h)
+        for i, layer in enumerate(self.layers):
+            h = nf.layers[i].data.pop('activation')
+            if self.dropout:
+                h = mx.nd.Dropout(h, p=self.dropout)
+            nf.layers[i].data['h'] = h
+            nf.flow_compute(fn.copy_src(src='h', out='m'),
+                            lambda node : {'h': node.mailbox['m'].mean(axis=1)},
+                            layer,
+                            range=i)
 
+        h = nf.layers[-1].data.pop('activation')
         return h
 
 
@@ -80,23 +72,30 @@ class GCNInfer(gluon.Block):
                  activation,
                  **kwargs):
         super(GCNInfer, self).__init__(**kwargs)
+        self.n_layers = n_layers
         with self.name_scope():
             self.layers = gluon.nn.Sequential()
             # input layer
-            self.layers.add(GCNLayer(0, in_feats, n_hidden, activation, 0, test=True))
+            self.layers.add(NodeUpdate(in_feats, n_hidden, activation, test=True))
             # hidden layers
             for i in range(1, n_layers):
-                self.layers.add(GCNLayer(i, n_hidden, n_hidden, activation, 0, test=True))
+                self.layers.add(NodeUpdate(n_hidden, n_hidden, activation, test=True))
             # output layer
-            self.layers.add(GCNLayer(n_layers, n_hidden, n_classes, None, 0, test=True))
+            self.layers.add(NodeUpdate(n_hidden, n_classes, test=True))
 
 
     def forward(self, nf):
-        h = nf.layers[0].data['features']
+        nf.layers[0].data['activation'] = nf.layers[0].data['features']
 
-        for layer in self.layers:
-            h = layer(nf, h)
+        for i, layer in enumerate(self.layers):
+            h = nf.layers[i].data.pop('activation')
+            nf.layers[i].data['h'] = h
+            nf.flow_compute(fn.copy_src(src='h', out='m'),
+                            fn.sum(msg='m', out='h'),
+                            layer,
+                            range=i)
 
+        h = nf.layers[-1].data.pop('activation')
         return h
 
 
@@ -104,13 +103,11 @@ def main(args):
     # load and preprocess dataset
     data = load_data(args)
 
-    if args.self_loop and args.dataset != 'reddit':
+    if args.self_loop and not args.dataset.startswith('reddit'):
         data.graph.add_edges_from([(i,i) for i in range(len(data.graph))])
 
     train_nid = mx.nd.array(np.nonzero(data.train_mask)[0]).astype(np.int64)
     test_nid = mx.nd.array(np.nonzero(data.test_mask)[0]).astype(np.int64)
-
-    num_neighbors = args.num_neighbors
 
     features = mx.nd.array(data.features)
     labels = mx.nd.array(data.labels)
@@ -122,8 +119,8 @@ def main(args):
     n_edges = data.graph.number_of_edges()
 
     n_train_samples = train_mask.sum().asscalar()
-    n_test_samples = test_mask.sum().asscalar()
     n_val_samples = val_mask.sum().asscalar()
+    n_test_samples = test_mask.sum().asscalar()
 
     print("""----Data statistics------'
       #Edges %d
@@ -141,12 +138,10 @@ def main(args):
 
     g.ndata['features'] = features
 
-    degs = g.in_degrees().astype('float32')
-    degs[degs == 0] = 1
-    degs[degs > num_neighbors] = num_neighbors
-    g.ndata['subg_norm'] = mx.nd.expand_dims(1./degs, 1)
+    num_neighbors = args.num_neighbors
 
-    norm = mx.nd.expand_dims(1./g.in_degrees().astype('float32'), 1)
+    degs = g.in_degrees().astype('float32')
+    norm = mx.nd.expand_dims(1./degs, 1)
     g.ndata['norm'] = norm
 
     model = GCNSampling(in_feats,
@@ -158,7 +153,6 @@ def main(args):
                         prefix='GCN')
 
     model.initialize()
-
     loss_fcn = gluon.loss.SoftmaxCELoss()
 
     infer_model = GCNInfer(in_feats,
@@ -179,8 +173,10 @@ def main(args):
     # initialize graph
     dur = []
     for epoch in range(args.n_epochs):
-        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.batch_size, num_neighbors,
-                                                            neighbor_type='in', shuffle=True,
+        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.batch_size,
+                                                            num_neighbors,
+                                                            neighbor_type='in',
+                                                            shuffle=True,
                                                             num_hops=args.n_layers+1,
                                                             seed_nodes=train_nid):
             nf.copy_from_parent()
@@ -203,8 +199,10 @@ def main(args):
 
         num_acc = 0.
 
-        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.test_batch_size, g.number_of_nodes(),
-                                                            neighbor_type='in', num_hops=args.n_layers+1,
+        for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.batch_size,
+                                                            g.number_of_nodes(),
+                                                            neighbor_type='in',
+                                                            num_hops=args.n_layers+1,
                                                             seed_nodes=test_nid):
             nf.copy_from_parent()
             pred = infer_model(nf)
@@ -226,10 +224,8 @@ if __name__ == '__main__':
             help="learning rate")
     parser.add_argument("--n-epochs", type=int, default=200,
             help="number of training epochs")
-    parser.add_argument("--batch-size", type=int, default=1000,
-            help="train batch size")
-    parser.add_argument("--test-batch-size", type=int, default=1000,
-            help="test batch size")
+    parser.add_argument("--batch-size", type=int, default=20,
+            help="batch size")
     parser.add_argument("--num-neighbors", type=int, default=3,
             help="number of neighbors to be sampled")
     parser.add_argument("--n-hidden", type=int, default=16,
@@ -245,5 +241,4 @@ if __name__ == '__main__':
     print(args)
 
     main(args)
-
 

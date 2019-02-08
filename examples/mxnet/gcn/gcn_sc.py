@@ -9,28 +9,24 @@ from dgl import DGLGraph
 from dgl.data import register_data_args, load_data
 
 
-def gcn_reduce(node, key='h'):
-    accum = mx.nd.mean(node.mailbox['m'], 1)
-    return {key: accum}
-
-
 class NodeUpdate(gluon.Block):
-    def __init__(self, in_feats, out_feats, activation=None):
+    def __init__(self, in_feats, out_feats, activation=None, test=False, concat=False):
         super(NodeUpdate, self).__init__()
         self.dense = gluon.nn.Dense(out_feats, in_units=in_feats)
         self.activation = activation
+        self.concat = concat
+        self.test = test
 
     def forward(self, node):
-        agg = node.data['h']
-        if 'agg' in node.data:
-            agg = mx.nd.concat(agg, node.data['agg'])
-        agg = self.dense(agg)
-        if self.activation:
-            h = self.activation(agg)
-            ret = {'activation': h, 'agg': agg}
-        else:
-            ret = {'activation': agg}
-        return ret
+        h = node.data['h']
+        if self.test:
+            h = h * node.data['norm']
+        h = self.dense(h)
+        if self.concat:
+            h = mx.nd.concat(h, self.activation(h))
+        elif self.activation:
+            h = self.activation(h)
+        return {'activation': h}
 
 
 class GCNSampling(gluon.Block):
@@ -48,12 +44,14 @@ class GCNSampling(gluon.Block):
         with self.name_scope():
             self.layers = gluon.nn.Sequential()
             # input layer
-            self.layers.add(NodeUpdate(in_feats, n_hidden, activation))
+            skip_start = (0 == n_layers-1)
+            self.layers.add(NodeUpdate(in_feats, n_hidden, activation, concat=skip_start))
             # hidden layers
-            for i in range(n_layers - 1):
-                self.layers.add(NodeUpdate(2*n_hidden, n_hidden, activation))
+            for i in range(1, n_layers):
+                skip_start = (i == n_layers-1)
+                self.layers.add(NodeUpdate(n_hidden, n_hidden, activation, concat=skip_start))
             # output layer
-            self.layers.add(NodeUpdate(2*n_hidden, n_classes, None))
+            self.layers.add(NodeUpdate(2*n_hidden, n_classes))
 
 
     def forward(self, nf):
@@ -65,13 +63,9 @@ class GCNSampling(gluon.Block):
                 h = mx.nd.Dropout(h, p=self.dropout)
             nf.layers[i].data['h'] = h
             nf.flow_compute(fn.copy_src(src='h', out='m'),
-                            gcn_reduce,
+                            lambda node : {'h': node.mailbox['m'].mean(axis=1)},
                             layer,
                             range=i)
-            if i < self.n_layers:
-                nf.flow_compute(fn.copy_src(src='agg', out='m'),
-                                partial(gcn_reduce, key='agg'),
-                                range=i+1)
 
         h = nf.layers[-1].data.pop('activation')
         return h
@@ -90,12 +84,14 @@ class GCNInfer(gluon.Block):
         with self.name_scope():
             self.layers = gluon.nn.Sequential()
             # input layer
-            self.layers.add(NodeUpdate(in_feats, n_hidden, activation))
+            skip_start = (0 == n_layers-1)
+            self.layers.add(NodeUpdate(in_feats, n_hidden, activation, test=True, concat=skip_start))
             # hidden layers
-            for i in range(n_layers - 1):
-                self.layers.add(NodeUpdate(2*n_hidden, n_hidden, activation))
+            for i in range(1, n_layers):
+                skip_start = (i == n_layers-1)
+                self.layers.add(NodeUpdate(n_hidden, n_hidden, activation, test=True, concat=skip_start))
             # output layer
-            self.layers.add(NodeUpdate(2*n_hidden, n_classes, None))
+            self.layers.add(NodeUpdate(2*n_hidden, n_classes, test=True))
 
 
     def forward(self, nf):
@@ -105,13 +101,9 @@ class GCNInfer(gluon.Block):
             h = nf.layers[i].data.pop('activation')
             nf.layers[i].data['h'] = h
             nf.flow_compute(fn.copy_src(src='h', out='m'),
-                            gcn_reduce,
+                            fn.sum(msg='m', out='h'),
                             layer,
                             range=i)
-            if i < self.n_layers:
-                nf.flow_compute(fn.copy_src(src='agg', out='m'),
-                                partial(gcn_reduce, key='agg'),
-                                range=i+1)
 
         h = nf.layers[-1].data.pop('activation')
         return h
@@ -121,7 +113,7 @@ def main(args):
     # load and preprocess dataset
     data = load_data(args)
 
-    if args.self_loop and args.dataset != 'reddit':
+    if args.self_loop and not args.dataset.startswith('reddit'):
         data.graph.add_edges_from([(i,i) for i in range(len(data.graph))])
 
     train_nid = mx.nd.array(np.nonzero(data.train_mask)[0]).astype(np.int64)
@@ -135,6 +127,11 @@ def main(args):
     in_feats = features.shape[1]
     n_classes = data.num_labels
     n_edges = data.graph.number_of_edges()
+
+    n_train_samples = train_mask.sum().asscalar()
+    n_val_samples = val_mask.sum().asscalar()
+    n_test_samples = test_mask.sum().asscalar()
+
     print("""----Data statistics------'
       #Edges %d
       #Classes %d
@@ -142,14 +139,20 @@ def main(args):
       #Val samples %d
       #Test samples %d""" %
           (n_edges, n_classes,
-              train_mask.sum().asscalar(),
-              val_mask.sum().asscalar(),
-              test_mask.sum().asscalar()))
+              n_train_samples,
+              n_val_samples,
+              n_test_samples))
 
     # create GCN model
     g = DGLGraph(data.graph, readonly=True)
 
     g.ndata['features'] = features
+
+    num_neighbors = args.num_neighbors
+
+    degs = g.in_degrees().astype('float32')
+    norm = mx.nd.expand_dims(1./degs, 1)
+    g.ndata['norm'] = norm
 
     model = GCNSampling(in_feats,
                         args.n_hidden,
@@ -160,7 +163,6 @@ def main(args):
                         prefix='GCN')
 
     model.initialize()
-    n_train_samples = train_mask.sum().asscalar()
     loss_fcn = gluon.loss.SoftmaxCELoss()
 
     infer_model = GCNInfer(in_feats,
@@ -192,7 +194,8 @@ def main(args):
             with mx.autograd.record():
                 pred = model(nf)
                 batch_nids = nf.layer_parent_nid(-1)
-                loss = loss_fcn(pred, labels[batch_nids])
+                batch_labels = labels[batch_nids]
+                loss = loss_fcn(pred, batch_labels)
                 loss = loss.sum() / len(batch_nids)
 
             loss.backward()
@@ -214,9 +217,10 @@ def main(args):
             nf.copy_from_parent()
             pred = infer_model(nf)
             batch_nids = nf.layer_parent_nid(-1)
-            num_acc += (pred.argmax(axis=1) == labels[batch_nids]).sum().asscalar()
+            batch_labels = labels[batch_nids]
+            num_acc += (pred.argmax(axis=1) == batch_labels).sum().asscalar()
 
-        print("Test Accuracy {:.4f}". format(num_acc/len(test_nid)))
+        print("Test Accuracy {:.4f}". format(num_acc/n_test_samples))
 
 
 if __name__ == '__main__':
