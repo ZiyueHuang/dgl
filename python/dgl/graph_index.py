@@ -976,8 +976,8 @@ def map_to_nodeflow_nid(nflow, layer_id, parent_nids):
     utils.Index
         Node Ids in the NodeFlow.
     """
-    mapping = nflow.node_mapping.tousertensor()
-    layers = nflow.layers.tonumpy()
+    mapping = nflow._node_mapping.tousertensor()
+    layers = nflow._layer_offsets
     start = int(layers[layer_id])
     end = int(layers[layer_id + 1])
     mapping = mapping[start:end]

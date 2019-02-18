@@ -301,6 +301,10 @@ NodeFlow ImmutableGraph::SampleSubgraph(IdArray seed_arr,
                             &tmp_sampled_edge_list,
                             &time_seed);
       }
+      // TODO: temporary hack for self-loop
+      tmp_sampled_src_list.push_back(dst_id);
+      tmp_sampled_edge_list.push_back(-1);
+
       CHECK_EQ(tmp_sampled_src_list.size(), tmp_sampled_edge_list.size());
       size_t pos = neighbor_list.size();
       neigh_pos.emplace_back(dst_id, pos);
