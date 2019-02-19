@@ -258,7 +258,7 @@ def main(args):
     for epoch in range(args.n_epochs):
         for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.batch_size, num_neighbors,
                                                             neighbor_type='in', shuffle=True,
-                                                            num_hops=n_layers,
+                                                            num_hops=n_layers, add_self_loop=True,
                                                             seed_nodes=train_nid):
             for i in range(n_layers):
                 agg_history_str = 'agg_h_{}'.format(i)
@@ -289,7 +289,7 @@ def main(args):
 
         for nf, aux in dgl.contrib.sampling.NeighborSampler(g, args.test_batch_size, g.number_of_nodes(),
                                                             neighbor_type='in', num_hops=n_layers,
-                                                            seed_nodes=test_nid):
+                                                            seed_nodes=test_nid, add_self_loop=True):
             nf.copy_from_parent(node_embed_names=[['preprocess', 'features'], ['norm', 'subg_norm']])
             pred = infer_model(nf)
             batch_nids = nf.layer_parent_nid(-1).as_in_context(ctx)

@@ -376,7 +376,8 @@ class Graph: public GraphInterface {
    * \return a subgraph
    */
   virtual NodeFlow NeighborUniformSample(IdArray seeds, const std::string &neigh_type,
-                                         int num_hops, int expand_factor) const;
+                                         int num_hops, int expand_factor,
+                                         const bool add_self_loop=false) const;
 
  protected:
   friend class GraphOp;

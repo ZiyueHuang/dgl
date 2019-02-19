@@ -234,7 +234,8 @@ NodeFlow ImmutableGraph::SampleSubgraph(IdArray seed_arr,
                                         const float* probability,
                                         const std::string &neigh_type,
                                         int num_hops,
-                                        size_t num_neighbor) const {
+                                        size_t num_neighbor,
+                                        const bool add_self_loop) const {
   unsigned int time_seed = time(nullptr);
   size_t num_seeds = seed_arr->shape[0];
   auto orig_csr = neigh_type == "in" ? GetInCSR() : GetOutCSR();
@@ -302,9 +303,10 @@ NodeFlow ImmutableGraph::SampleSubgraph(IdArray seed_arr,
                             &time_seed);
       }
       // TODO: temporary hack for self-loop
-      tmp_sampled_src_list.push_back(dst_id);
-      tmp_sampled_edge_list.push_back(-1);
-
+      if (add_self_loop) {
+        tmp_sampled_src_list.push_back(dst_id);
+        tmp_sampled_edge_list.push_back(-1);
+      }
       CHECK_EQ(tmp_sampled_src_list.size(), tmp_sampled_edge_list.size());
       size_t pos = neighbor_list.size();
       neigh_pos.emplace_back(dst_id, pos);
@@ -456,12 +458,14 @@ NodeFlow ImmutableGraph::SampleSubgraph(IdArray seed_arr,
 
 NodeFlow ImmutableGraph::NeighborUniformSample(IdArray seeds,
                                                const std::string &neigh_type,
-                                               int num_hops, int expand_factor) const {
+                                               int num_hops, int expand_factor,
+                                               const bool add_self_loop) const {
   return SampleSubgraph(seeds,                 // seed vector
                         nullptr,               // sample_id_probability
                         neigh_type,
                         num_hops + 1,
-                        expand_factor);
+                        expand_factor,
+                        add_self_loop);
 }
 
 }  // namespace dgl

@@ -17,7 +17,7 @@ except ImportError:
 __all__ = ['NeighborSampler']
 
 class NSSubgraphLoader(object):
-    def __init__(self, g, batch_size, expand_factor, num_hops=1,
+    def __init__(self, g, batch_size, expand_factor, num_hops=1, add_self_loop=False,
                  neighbor_type='in', node_prob=None, seed_nodes=None,
                  shuffle=False, num_workers=1, return_seed_id=False):
         self._g = g
@@ -27,6 +27,7 @@ class NSSubgraphLoader(object):
         self._expand_factor = expand_factor
         self._num_hops = num_hops
         self._node_prob = node_prob
+        self._add_self_loop = add_self_loop
         self._return_seed_id = return_seed_id
         if self._node_prob is not None:
             assert self._node_prob.shape[0] == g.number_of_nodes(), \
@@ -56,7 +57,7 @@ class NSSubgraphLoader(object):
             self._subgraph_idx += 1
         sgi = self._g._graph.neighbor_sampling(seed_ids, self._expand_factor,
                                                self._num_hops, self._neighbor_type,
-                                               self._node_prob)
+                                               self._node_prob, self._add_self_loop)
         subgraphs = [NodeFlow(self._g, i) for i in sgi]
         self._subgraphs.extend(subgraphs)
         if self._return_seed_id:
@@ -194,7 +195,7 @@ class _PrefetchingLoader(object):
 
 def NeighborSampler(g, batch_size, expand_factor, num_hops=1,
                     neighbor_type='in', node_prob=None, seed_nodes=None,
-                    shuffle=False, num_workers=1,
+                    shuffle=False, num_workers=1, add_self_loop=False,
                     return_seed_id=False, prefetch=False):
     '''Create a sampler that samples neighborhood.
 
@@ -248,7 +249,8 @@ def NeighborSampler(g, batch_size, expand_factor, num_hops=1,
         The iterator returns a list of batched subgraphs and a dictionary of additional
         information about the subgraphs.
     '''
-    loader = NSSubgraphLoader(g, batch_size, expand_factor, num_hops, neighbor_type, node_prob,
+    loader = NSSubgraphLoader(g, batch_size, expand_factor, num_hops,
+                              add_self_loop, neighbor_type, node_prob,
                               seed_nodes, shuffle, num_workers, return_seed_id)
     if not prefetch:
         return loader
